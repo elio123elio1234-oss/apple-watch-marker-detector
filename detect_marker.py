@@ -153,10 +153,11 @@ class ScreenDetector:
     MODE_COASTING = 2
 
     # --- HSV colour ranges ---
-    WIDE_HSV = (np.array([25, 40, 25]), np.array([115, 255, 255]))
-    WIDE_HSV_RELAXED = (np.array([18, 25, 15]), np.array([122, 255, 255]))
-    CYAN_HSV = (np.array([78, 60, 25]), np.array([115, 255, 255]))
-    GREEN_HSV = (np.array([25, 60, 25]), np.array([76, 255, 255]))
+    WIDE_HSV = (np.array([25, 40, 30]), np.array([115, 255, 255]))
+    # Relaxed: slightly wider, but NOT so wide it catches random objects
+    WIDE_HSV_RELAXED = (np.array([20, 30, 20]), np.array([118, 255, 255]))
+    CYAN_HSV = (np.array([78, 50, 20]), np.array([115, 255, 255]))
+    GREEN_HSV = (np.array([25, 50, 20]), np.array([76, 255, 255]))
 
     def __init__(self, screen_width_mm=37.6, screen_height_mm=46.0):
         self.screen_w = screen_width_mm
@@ -187,6 +188,10 @@ class ScreenDetector:
         self._prev_corners = None
         self._corner_max_jump = 80
 
+        # ---- Size gating (prevents lock-on to wrong objects) ----
+        self._prev_area = None        # last known marker area in pixels
+        self._area_ratio_max = 2.5    # reject if area changes >2.5x
+
         # ---- One Euro Filters ----
         self._filt_body_rot = OneEuroFilter(
             min_cutoff=0.4, beta=0.004, d_cutoff=1.0)
@@ -207,6 +212,9 @@ class ScreenDetector:
         # ---- Confidence ----
         self._det_history = deque(maxlen=30)
         self._confidence = 0.0
+
+        # ---- Running median pre-filter for body rotation ----
+        self._rot_buffer = deque(maxlen=5)
 
         # CLI compat
         self._smooth_factor = 0.4
@@ -299,23 +307,39 @@ class ScreenDetector:
             has_split = (cyan_in > area * split_thr
                          and green_in > area * split_thr)
 
-            has_dominant = False
-            if relaxed:
-                has_dominant = (cyan_in > area * 0.20
-                                or green_in > area * 0.20)
+            # At extreme angles one colour dominates, but we STILL
+            # require at least a TRACE of the minority colour.
+            # This prevents locking onto random green/cyan objects.
+            has_weak_split = False
+            if relaxed and not has_split:
+                minor = min(cyan_in, green_in)
+                major = max(cyan_in, green_in)
+                # Major colour must be strong, minor must exist at all
+                has_weak_split = (major > area * 0.15
+                                  and minor > max(area * 0.02, 3))
 
             has_dark = self._check_surround(gray, poly_mask)
 
-            if not has_split and not has_dark and not has_dominant:
+            # ALWAYS require some colour evidence — dark surround alone
+            # is not enough (too many false positives from dark objects)
+            if not has_split and not has_weak_split:
                 continue
+
+            # Size gating: if we have a previous size, reject candidates
+            # that are wildly different (prevents jumping to bg objects)
+            if self._prev_area is not None and self._mode != self.MODE_SEARCH:
+                size_ratio = area / max(self._prev_area, 1)
+                if (size_ratio > self._area_ratio_max
+                        or size_ratio < 1.0 / self._area_ratio_max):
+                    continue
 
             score = area * rectangularity
             if has_split:
                 score *= 3.0
             if has_dark:
                 score *= 1.5
-            if has_dominant and not has_split:
-                score *= 1.2
+            if has_weak_split and not has_split:
+                score *= 1.3
 
             if score > best_score:
                 best_score = score
@@ -546,6 +570,27 @@ class ScreenDetector:
                 continue
             if screen_diag > 1 and err > screen_diag * 2.5:
                 continue
+
+            # PHYSICS CONSTRAINT: the screen must face the camera.
+            # The screen normal in camera coords = R[:,2].
+            # For a visible screen, the normal's Z component (towards
+            # camera) should be positive (screen faces us).
+            # In some setups (synthetic tests, flipped coords), all
+            # solutions can be negative — we handle this by checking
+            # that tz and normal_z have CONSISTENT signs.
+            R_check, _ = cv2.Rodrigues(rv)
+            screen_normal_z = R_check[2, 2]
+            tz_val = tv[2][0]
+
+            # Both should have the same sign (consistent geometry).
+            # If tz > 0 (in front) then normal_z should be > 0 (facing us).
+            # If both negative (synthetic), that's also internally consistent.
+            # Reject only if they DISAGREE (one positive, one negative).
+            signs_consistent = (screen_normal_z * tz_val > 0
+                                or abs(screen_normal_z) < 0.1)
+            if not signs_consistent:
+                continue
+
             valid.append((rv, tv, err))
 
         if not valid:
@@ -553,9 +598,18 @@ class ScreenDetector:
 
         # ------ Select best using temporal continuity ------
         if self._prev_rvec is not None and len(valid) > 1:
-            best = min(valid, key=lambda c: self._pose_distance(c[0], c[1]))
+            # Among candidates, prefer the one with physics-correct
+            # normal AND closest to previous frame
+            best = min(valid,
+                       key=lambda c: self._pose_distance(c[0], c[1]))
         else:
-            best = min(valid, key=lambda c: c[2])
+            # First frame: pick the solution where screen faces camera
+            # most directly (highest |normal_z|)
+            def _initial_score(c):
+                R_c, _ = cv2.Rodrigues(c[0])
+                facing = abs(R_c[2, 2])  # higher = more frontal
+                return -facing + c[2] * 0.01  # prefer facing + low error
+            best = min(valid, key=_initial_score)
 
         rvec_raw, tvec_raw, reproj_err = best
 
@@ -583,12 +637,26 @@ class ScreenDetector:
         # ------ Body Rotation ------
         # Screen normal in camera frame = R's 3rd column.
         # dot(normal, camera_Z=[0,0,1]) = rmat[2,2].
-        # abs() handles either normal direction.
+        # Use abs() because in some configurations (synthetic test,
+        # flipped coords) the normal consistently points backward.
+        # What matters is the ANGLE between normal and view axis.
         cos_angle = float(np.clip(abs(rmat[2, 2]), 0.0, 1.0))
         body_rot_raw = float(np.degrees(np.arccos(cos_angle)))
 
-        body_rotation = self._filt_body_rot(body_rot_raw, t_now)
+        # Running median pre-filter: reject outlier spikes BEFORE
+        # One Euro Filter. A single bad frame can't fool the median.
+        self._rot_buffer.append(body_rot_raw)
+        if len(self._rot_buffer) >= 3:
+            body_rot_median = float(np.median(list(self._rot_buffer)))
+        else:
+            body_rot_median = body_rot_raw
+
+        body_rotation = self._filt_body_rot(body_rot_median, t_now)
         body_rotation = float(np.clip(body_rotation, 0.0, 90.0))
+
+        # Update size gating reference
+        self._prev_area = float(cv2.contourArea(
+            corners.astype(np.float32)))
 
         # ECG position mapping
         if body_rotation < 15:
@@ -998,6 +1066,8 @@ class ScreenDetector:
         self._filt_dist.reset()
         self._filt_ax.reset()
         self._filt_ay.reset()
+        self._rot_buffer.clear()
+        self._prev_area = None
 
     # ================================================================ #
     #                   Utility                                         #
