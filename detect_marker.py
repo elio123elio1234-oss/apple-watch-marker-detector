@@ -228,6 +228,9 @@ class ScreenDetector:
         self._confirm_count = 0
         self._confirm_required = 3
 
+        # ---- Last known position for proximity preference ----
+        self._last_known_center = None
+
         # CLI compat
         self._smooth_factor = 0.4
 
@@ -376,27 +379,37 @@ class ScreenDetector:
                 balance_score = min(balance * 2.0, 1.0)
 
             # 3) SPATIAL split: cyan and green on OPPOSITE sides.
-            #    This is THE key differentiator vs random reflections
-            #    where colours are randomly mixed.
-            spatial_score = 0.0
+            #    HARD FILTER — reject if centroids are not separated
+            #    by at least 15% of the blob width. Mirrors scatter
+            #    colours randomly; our marker has a clean L/R split.
             cy_roi = cv2.bitwise_and(
                 cyan_full[by:by2, bx:bx2], small_mask)
             gr_roi = cv2.bitwise_and(
                 green_full[by:by2, bx:bx2], small_mask)
             cy_xs = np.where(cy_roi > 0)[1]
             gr_xs = np.where(gr_roi > 0)[1]
-            if len(cy_xs) >= 3 and len(gr_xs) >= 3:
-                sep = abs(float(np.mean(cy_xs)) - float(np.mean(gr_xs)))
-                spatial_score = min(sep / max(bw_r * 0.25, 1), 1.0)
+            if len(cy_xs) < 3 or len(gr_xs) < 3:
+                continue  # not enough colour evidence
+            sep = abs(float(np.mean(cy_xs)) - float(np.mean(gr_xs)))
+            min_sep = max(bw_r * 0.12, 3)  # at least 12% of width
+            if sep < min_sep:
+                continue  # colours not spatially separated => NOT our marker
+            spatial_score = min(sep / max(bw_r * 0.25, 1), 1.0)
 
-            # 4) Brightness: OLED is self-emitting (bright), not a
-            #    dim reflection from ambient light.
+            # 4) Mean SATURATION inside the blob: OLED marker is
+            #    highly saturated; mirror reflections are washed out.
+            s_roi = hsv[by:by2, bx:bx2, 1]
+            s_in = s_roi[small_mask > 0]
+            mean_s = float(np.mean(s_in)) if len(s_in) > 0 else 0
+            sat_score = min(mean_s / 80.0, 1.0)
+
+            # 5) Brightness: OLED is self-emitting (bright).
             v_roi = hsv[by:by2, bx:bx2, 2]
             v_in = v_roi[small_mask > 0]
             mean_v = float(np.mean(v_in)) if len(v_in) > 0 else 0
             bright_score = min(mean_v / 120.0, 1.0)
 
-            # 5) Colour coverage: what fraction of the blob is our
+            # 6) Colour coverage: what fraction of the blob is our
             #    colour? Real marker is nearly 100% coloured.
             coverage = total_c / max(area, 1)
             coverage_score = min(coverage / 0.7, 1.0)
@@ -404,18 +417,33 @@ class ScreenDetector:
             # Combine (multiplicative — each factor gates the rest)
             score = ((0.3 + rectangularity)
                      * (0.1 + aspect_score * 3.0)      # aspect   huge
-                     * (0.1 + spatial_score * 4.0)      # spatial  huge
+                     * (0.1 + spatial_score * 5.0)      # spatial  dominant
                      * (0.3 + balance_score * 2.0)      # balance  large
+                     * (0.3 + sat_score * 2.0)          # saturation large
                      * (0.5 + bright_score)              # bright   moderate
                      * (0.5 + coverage_score)            # coverage moderate
-                     * (1.0 + np.log1p(area) * 0.08))   # area     mild
+                     * (1.0 + np.log1p(area) * 0.05))   # area     tiny
 
             if has_split:
                 score *= 2.0
             if has_dark:
                 score *= 1.3
             if has_weak_split and not has_split:
-                score *= 0.7  # weak split is suspicious
+                score *= 0.5  # weak split is very suspicious
+
+            # Proximity preference: if we recently lost track, prefer
+            # candidates near the last known position.
+            if (self._last_known_center is not None
+                    and self._mode == self.MODE_SEARCH
+                    and self._frames_lost < 60):
+                blob_cx = bx + bw_r / 2.0
+                blob_cy = by + bh_r / 2.0
+                dist_to_last = np.hypot(
+                    blob_cx - self._last_known_center[0],
+                    blob_cy - self._last_known_center[1])
+                # Objects near the last position get up to 3x bonus
+                prox = max(0.0, 1.0 - dist_to_last / 400.0)
+                score *= (1.0 + prox * 2.0)
 
             if score > best_score:
                 best_score = score
@@ -724,14 +752,31 @@ class ScreenDetector:
         # near gimbal-lock singularities.
         rmat, _ = cv2.Rodrigues(rvec_raw)
 
-        # ------ Body Rotation ------
-        # Screen normal in camera frame = R's 3rd column.
-        # dot(normal, camera_Z=[0,0,1]) = rmat[2,2].
-        # Use abs() because in some configurations (synthetic test,
-        # flipped coords) the normal consistently points backward.
-        # What matters is the ANGLE between normal and view axis.
-        cos_angle = float(np.clip(abs(rmat[2, 2]), 0.0, 1.0))
-        body_rot_raw = float(np.degrees(np.arccos(cos_angle)))
+        # ------ Body Rotation (GEOMETRIC METHOD) ------
+        # Instead of using PnP's rotation matrix (which is unstable
+        # at steep viewing angles), compute body rotation DIRECTLY
+        # from corner geometry: the foreshortening of the screen
+        # width tells us the viewing angle.
+        #
+        #   cos(body_rot) = (observed_width / observed_height)
+        #                   / (real_width / real_height)
+        #
+        # This is rock-solid even at 75° because it only uses
+        # distances between corner pairs — no matrix inversion.
+        top_w = float(np.linalg.norm(corners[1] - corners[0]))
+        bot_w = float(np.linalg.norm(corners[2] - corners[3]))
+        left_h = float(np.linalg.norm(corners[3] - corners[0]))
+        right_h = float(np.linalg.norm(corners[2] - corners[1]))
+        obs_w = (top_w + bot_w) / 2.0
+        obs_h = (left_h + right_h) / 2.0
+
+        if obs_h > 1.0:
+            obs_ratio = obs_w / obs_h
+            real_ratio = self.screen_w / self.screen_h
+            cos_body = np.clip(obs_ratio / real_ratio, 0.0, 1.0)
+            body_rot_raw = float(np.degrees(np.arccos(cos_body)))
+        else:
+            body_rot_raw = 0.0
 
         # Running median pre-filter: reject outlier spikes BEFORE
         # One Euro Filter. A single bad frame can't fool the median.
@@ -1024,6 +1069,7 @@ class ScreenDetector:
                 int(np.min(xs)) - pad, int(np.min(ys)) - pad,
                 int(np.ptp(xs)) + 2 * pad, int(np.ptp(ys)) + 2 * pad,
             )
+            self._last_known_center = np.array([cx, cy])
             self._frames_lost = 0
             self._frames_locked += 1
             self._det_history.append(1)
@@ -1185,6 +1231,7 @@ class ScreenDetector:
         self._prev_area = None
         self._filt_corners.reset()
         self._confirm_count = 0
+        # NOTE: do NOT reset _last_known_center — it helps re-acquisition
 
     # ================================================================ #
     #                   Utility                                         #
