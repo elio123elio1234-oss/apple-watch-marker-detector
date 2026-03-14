@@ -420,18 +420,19 @@ def main():
     print()
     print(f"  Watch: {args.watch_model}  Screen: {sw:.1f}×{sh:.1f}mm")
     print()
-    print(f"  📱  פתח בטלפון:")
-    print(f"       http://{local_ip}:{args.port}")
+    print(f"  📱  פתח בטלפון (HTTPS):")
+    print(f"       https://{local_ip}:{args.port}")
     print()
     print(f"  🖥️  MJPEG stream (PC):")
-    print(f"       http://{local_ip}:{args.port}/stream")
+    print(f"       https://{local_ip}:{args.port}/stream")
     print()
     print("  ודא שהטלפון והמחשב על אותו WiFi!")
+    print("  בטלפון: קבל את אזהרת האבטחה (Advanced → Proceed)")
     print("=" * 56)
     print()
 
     app.run(host=args.host, port=args.port,
-            debug=False, threaded=True)
+            debug=False, threaded=True, ssl_context='adhoc')
 
 
 if __name__ == "__main__":

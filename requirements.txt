@@ -1,3 +1,4 @@
 opencv-python>=4.5.0
 numpy>=1.20.0
 flask>=2.0.0
+pyopenssl>=22.0.0
