@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SplitScreen Marker v4 — Test Pipeline
+SplitScreen Marker v5 — Test Pipeline
 =======================================
 Tests the full generate→detect pipeline with synthetic scenes.
 

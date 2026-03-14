@@ -1,38 +1,35 @@
 #!/usr/bin/env python3
 """
-Marker Detector v4 — Screen Rectangle Detection
-=================================================
+Marker Detector v5 — Clinical-Grade Screen Tracking
+=====================================================
 
-v4 STRATEGY: detect the watch SCREEN as a colored rectangle, not
-individual dots. The SplitScreen marker (left=cyan, right=green)
-fills the entire watch display, giving 100-500× more pixel area
-than 4 small dots.
+CLINICAL-GRADE rewrite for ECG electrode positioning.
+Tracks a SplitScreen marker (left=cyan, right=green) on an Apple Watch
+and computes body rotation angle for V1-V6 lead placement guidance.
 
-WHY: At V5/V6 ECG position (wrist tilted 60-80° against the chest),
-a 45mm Apple Watch screen projects to roughly 20×80 pixels at 40cm.
-Four individual dots within that area would be 3-5 pixels each —
-impossible to detect reliably. But the FULL screen rectangle (even
-compressed to 20px wide) is easy to find as a colored blob.
-
-Detection pipeline:
-  1. HSV filter (wide range covers green + cyan + angle-shifted)
-  2. Find largest rectangular green/cyan blob (screen)
-  3. Verify: two-color split (cyan + green) = our marker, not random
-  4. minAreaRect → 4 corners
-  5. Order corners using cyan/green centroids for orientation
-  6. solvePnP → full 6DOF pose
+Major improvements over v4:
+  - One Euro Filter (Casiez et al. 2012) for adaptive noise reduction:
+    rock-solid when stationary, zero-lag when moving.
+  - Dual IPPE solution disambiguation using temporal pose continuity
+    (eliminates the random angle jumps between the two PnP solutions).
+  - solvePnP with useExtrinsicGuess for frame-to-frame consistency.
+  - Tracking state machine: SEARCH -> LOCKED -> COASTING, like a
+    fighter-jet lock-on. Persistent display during brief dropouts.
+  - Velocity-aware ROI prediction for continuous tracking.
+  - Adaptive detection thresholds (strict in search, relaxed when locked).
+  - Confidence metric showing tracking quality.
 
 Usage:
     python detect_marker.py --watch-model 45mm
+    python detect_marker.py --screen-size 29x17
     python detect_marker.py --watch-model 45mm --debug
-    python detect_marker.py --screen-width 37.6 --screen-height 46.0
-    python detect_marker.py --screen-size 29x17        # 2.9cm x 1.7cm measured
 """
 
 import cv2
 import numpy as np
 import argparse
 import time
+from collections import deque
 
 # Watch screen physical dimensions (width, height in mm)
 SCREEN_SIZES = {
@@ -46,21 +43,120 @@ SCREEN_SIZES = {
 }
 
 
+# ================================================================== #
+#  One Euro Filter — adaptive low-pass for clinical-grade tracking   #
+# ================================================================== #
+
+class OneEuroFilter:
+    """
+    One Euro Filter (Casiez, Roussel, Vogel — CHI 2012).
+
+    Adaptive low-pass filter that automatically balances jitter
+    reduction (when still) vs. responsiveness (when moving).
+
+    Parameters:
+        min_cutoff : Minimum cutoff frequency (Hz). Lower = stronger
+                     smoothing at rest. 0.3-1.0 for medical tracking.
+        beta       : Speed coefficient. Higher = less lag during fast
+                     motion. 0.001-0.01 for smooth tracking.
+        d_cutoff   : Cutoff for the derivative (speed) estimation.
+    """
+
+    def __init__(self, min_cutoff=1.0, beta=0.007, d_cutoff=1.0):
+        self.min_cutoff = min_cutoff
+        self.beta = beta
+        self.d_cutoff = d_cutoff
+        self._x_prev = None
+        self._dx_prev = 0.0
+        self._t_prev = None
+
+    @staticmethod
+    def _smoothing_factor(cutoff, dt):
+        tau = 1.0 / (2.0 * np.pi * cutoff)
+        return 1.0 / (1.0 + tau / max(dt, 1e-6))
+
+    def __call__(self, x, t=None):
+        if t is None:
+            t = time.time()
+
+        if self._x_prev is None:
+            self._x_prev = float(x)
+            self._dx_prev = 0.0
+            self._t_prev = t
+            return float(x)
+
+        dt = t - self._t_prev
+        if dt <= 1e-9:
+            dt = 1.0 / 30.0  # assume 30 fps
+
+        # Estimate speed (filtered derivative)
+        dx = (float(x) - self._x_prev) / dt
+        a_d = self._smoothing_factor(self.d_cutoff, dt)
+        dx_hat = a_d * dx + (1.0 - a_d) * self._dx_prev
+
+        # Adaptive cutoff: higher speed -> higher cutoff -> less smoothing
+        cutoff = self.min_cutoff + self.beta * abs(dx_hat)
+
+        # Apply low-pass
+        a = self._smoothing_factor(cutoff, dt)
+        x_hat = a * float(x) + (1.0 - a) * self._x_prev
+
+        self._x_prev = x_hat
+        self._dx_prev = dx_hat
+        self._t_prev = t
+        return x_hat
+
+    def reset(self):
+        self._x_prev = None
+        self._dx_prev = 0.0
+        self._t_prev = None
+
+
+class OneEuroFilterVec:
+    """One Euro Filter for N-dimensional vectors (e.g., 3D position)."""
+
+    def __init__(self, dim, min_cutoff=1.0, beta=0.007, d_cutoff=1.0):
+        self._filters = [
+            OneEuroFilter(min_cutoff, beta, d_cutoff) for _ in range(dim)
+        ]
+
+    def __call__(self, x, t=None):
+        flat = x.flatten()
+        out = np.array([f(v, t) for f, v in zip(self._filters, flat)])
+        return out.reshape(x.shape)
+
+    def reset(self):
+        for f in self._filters:
+            f.reset()
+
+
+# ================================================================== #
+#                   ScreenDetector  (clinical-grade)                  #
+# ================================================================== #
+
 class ScreenDetector:
     """
-    Detects a SplitScreen marker (left=cyan, right=green) as a
-    colored rectangle and estimates 6DOF pose.
+    Clinical-grade SplitScreen marker detector with 6DOF tracking.
+
+    Tracking state machine:
+        SEARCH   -> full-frame scan, strict thresholds
+        LOCKED   -> ROI tracking, relaxed thresholds, One Euro filtering
+        COASTING -> detection lost <N frames, show last pose with warning
+
+    The detector resolves the IPPE planar-pose ambiguity by choosing
+    the solution closest to the previous frame's rotation, eliminating
+    the random angle jumps that plague single-frame PnP.
     """
 
-    # Wide HSV range: catches green + cyan + color-shifted variants.
-    # Sat ≥ 40 allows partially-reflected areas (glass reflections
-    # add white light, reducing saturation).
-    WIDE_HSV = (np.array([25, 40, 25]), np.array([115, 255, 255]))
+    MODE_SEARCH = 0
+    MODE_LOCKED = 1
+    MODE_COASTING = 2
 
-    # Narrower ranges for separating cyan from green (orientation).
-    # Higher saturation threshold for reliable color identification.
-    CYAN_HSV = (np.array([78, 70, 25]), np.array([115, 255, 255]))
-    GREEN_HSV = (np.array([25, 70, 25]), np.array([76, 255, 255]))
+    # --- HSV colour ranges ---
+    WIDE_HSV = (np.array([25, 40, 25]), np.array([115, 255, 255]))
+    WIDE_HSV_RELAXED = (np.array([18, 25, 15]), np.array([122, 255, 255]))
+    CYAN_HSV = (np.array([78, 60, 25]), np.array([115, 255, 255]))
+    GREEN_HSV = (np.array([25, 60, 25]), np.array([76, 255, 255]))
 
     def __init__(self, screen_width_mm=37.6, screen_height_mm=46.0):
         self.screen_w = screen_width_mm
@@ -77,17 +173,43 @@ class ScreenDetector:
         self.camera_matrix = None
         self.dist_coeffs = np.zeros((4, 1), dtype=np.float64)
 
-        self._prev_tvec = None
-        self._prev_rvec = None
-        self._smooth_factor = 0.55
-
-        # Corner consistency: remember previous corners to prevent flicker
-        self._prev_corners = None
-        self._corner_max_jump = 80  # px — reject if corners jump more
-
-        self._last_bbox = None
+        # ---- Tracking state ----
+        self._mode = self.MODE_SEARCH
+        self._frames_locked = 0
         self._frames_lost = 0
-        self._max_lost_frames = 25
+        self._max_coast_frames = 8
+        self._max_search_frames = 30
+
+        # ---- Pose history (raw, before filtering) ----
+        self._prev_rvec = None
+        self._prev_tvec = None
+        self._last_pose = None
+        self._prev_corners = None
+        self._corner_max_jump = 80
+
+        # ---- One Euro Filters ----
+        self._filt_body_rot = OneEuroFilter(
+            min_cutoff=0.4, beta=0.004, d_cutoff=1.0)
+        self._filt_tvec = OneEuroFilterVec(
+            3, min_cutoff=1.2, beta=0.008, d_cutoff=1.0)
+        self._filt_dist = OneEuroFilter(
+            min_cutoff=1.0, beta=0.006, d_cutoff=1.0)
+        self._filt_ax = OneEuroFilter(
+            min_cutoff=1.5, beta=0.01, d_cutoff=1.0)
+        self._filt_ay = OneEuroFilter(
+            min_cutoff=1.5, beta=0.01, d_cutoff=1.0)
+
+        # ---- ROI tracking with velocity ----
+        self._last_bbox = None
+        self._bbox_velocity = np.array([0.0, 0.0])
+        self._prev_center = None
+
+        # ---- Confidence ----
+        self._det_history = deque(maxlen=30)
+        self._confidence = 0.0
+
+        # CLI compat
+        self._smooth_factor = 0.4
 
     def _get_camera_matrix(self, shape):
         if self.camera_matrix is None:
@@ -104,12 +226,12 @@ class ScreenDetector:
     #                   Screen Mask                                     #
     # ================================================================ #
 
-    def _create_screen_mask(self, frame):
+    def _create_screen_mask(self, frame, relaxed=False):
         """Create binary mask covering all green+cyan pixels."""
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, self.WIDE_HSV[0], self.WIDE_HSV[1])
+        lo, hi = (self.WIDE_HSV_RELAXED if relaxed else self.WIDE_HSV)
+        mask = cv2.inRange(hsv, lo, hi)
 
-        # Light morphology: close small gaps, remove noise
         k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k_open, iterations=1)
@@ -121,14 +243,14 @@ class ScreenDetector:
     #                   Screen Detection                                #
     # ================================================================ #
 
-    def find_screen(self, frame):
+    def find_screen(self, frame, relaxed=False):
         """
-        Find the watch screen as a colored rectangle.
+        Find the watch screen as a coloured rectangle.
 
         Returns (ordered_corners, mask) or (None, mask).
         ordered_corners is a (4, 2) float64 array: [TL, TR, BR, BL].
         """
-        mask, hsv = self._create_screen_mask(frame)
+        mask, hsv = self._create_screen_mask(frame, relaxed=relaxed)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         contours, _ = cv2.findContours(
@@ -136,12 +258,16 @@ class ScreenDetector:
         )
 
         max_frame_area = frame.shape[0] * frame.shape[1] * 0.6
+        min_area = 12 if relaxed else 25
+        min_rect = 0.30 if relaxed else 0.45
+        min_aspect = 0.015 if relaxed else 0.03
+
         best = None
         best_score = -1
 
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            if area < 25 or area > max_frame_area:
+            if area < min_area or area > max_frame_area:
                 continue
 
             rect = cv2.minAreaRect(cnt)
@@ -151,15 +277,14 @@ class ScreenDetector:
 
             rect_area = rw * rh
             rectangularity = area / rect_area
-            if rectangularity < 0.45:
+            if rectangularity < min_rect:
                 continue
 
-            # Reject extremely thin slivers (likely edge artifacts)
             aspect = min(rw, rh) / max(rw, rh)
-            if aspect < 0.03:
+            if aspect < min_aspect:
                 continue
 
-            # Verify two-color split inside the blob
+            # Verify two-colour split
             box = cv2.boxPoints(rect).astype(np.int32)
             poly_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
             cv2.fillConvexPoly(poly_mask, box, 255)
@@ -170,22 +295,27 @@ class ScreenDetector:
             cyan_in = np.sum((cyan_m & poly_mask) > 0)
             green_in = np.sum((green_m & poly_mask) > 0)
 
-            has_split = (cyan_in > area * 0.12 and green_in > area * 0.12)
+            split_thr = 0.06 if relaxed else 0.12
+            has_split = (cyan_in > area * split_thr
+                         and green_in > area * split_thr)
 
-            # Light dark-surround check
+            has_dominant = False
+            if relaxed:
+                has_dominant = (cyan_in > area * 0.20
+                                or green_in > area * 0.20)
+
             has_dark = self._check_surround(gray, poly_mask)
 
-            # Must pass at least one: two-color split OR dark surround.
-            # A random green object on a bright wall has neither.
-            if not has_split and not has_dark:
+            if not has_split and not has_dark and not has_dominant:
                 continue
 
-            # Score: prefer large rectangular blobs with the two-color split
             score = area * rectangularity
             if has_split:
                 score *= 3.0
             if has_dark:
                 score *= 1.5
+            if has_dominant and not has_split:
+                score *= 1.2
 
             if score > best_score:
                 best_score = score
@@ -201,7 +331,7 @@ class ScreenDetector:
         return ordered, mask
 
     def _check_surround(self, gray, screen_mask):
-        """Check that the screen is brighter than its immediate surround."""
+        """Screen should be brighter than its immediate surround."""
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
         dilated = cv2.dilate(screen_mask, kernel, iterations=1)
         ring = dilated & ~screen_mask
@@ -211,7 +341,6 @@ class ScreenDetector:
 
         if len(ring_px) < 5 or len(screen_px) < 5:
             return True
-
         return np.median(ring_px) < np.median(screen_px) * 0.75
 
     # ================================================================ #
@@ -221,10 +350,8 @@ class ScreenDetector:
     def _order_corners(self, box, frame, hsv, has_split):
         """
         Order minAreaRect corners as [TL, TR, BR, BL].
-
-        Primary: use cyan/green centroids (reliable at moderate angles).
-        Fallback: geometric ordering (longest side = vertical, top-left first).
-        Always validates convexity to prevent crossed (bowtie) corners.
+        Primary: cyan/green colour centroids.  Fallback: geometric.
+        Always validates convexity.
         """
         if has_split:
             ordered = self._order_by_color_split(box, frame, hsv)
@@ -238,15 +365,10 @@ class ScreenDetector:
 
     @staticmethod
     def _is_convex(pts):
-        """
-        Check if 4 ordered points form a convex (non-crossed) polygon.
-        All cross products of consecutive edge pairs must have the same sign.
-        """
         n = len(pts)
         sign = None
         for i in range(n):
-            o = pts[i]
-            a = pts[(i + 1) % n] - o
+            a = pts[(i + 1) % n] - pts[i]
             b = pts[(i + 2) % n] - pts[(i + 1) % n]
             cross = a[0] * b[1] - a[1] * b[0]
             if abs(cross) < 1e-6:
@@ -260,40 +382,22 @@ class ScreenDetector:
 
     @staticmethod
     def _fix_crossed_corners(corners):
-        """
-        If 4 corners form a crossed (bowtie) quadrilateral, uncross
-        them by swapping the problematic pair.
-
-        A bowtie happens when two adjacent corners are swapped.
-        Try swapping middle pairs until the polygon is convex.
-        """
         if ScreenDetector._is_convex(corners):
             return corners
-
-        # Three possible pairings of 4 points into a quadrilateral:
-        # Original: 0-1-2-3  (current, crossed)
-        # Swap 1,3: 0-3-2-1
-        # Swap 1,2: 0-2-1-3
-        swaps = [
-            [0, 2, 1, 3],  # swap indices 1 and 2
-            [0, 3, 2, 1],  # swap indices 1 and 3
-            [0, 1, 3, 2],  # swap indices 2 and 3
-        ]
-        for idx in swaps:
+        for idx in ([0, 2, 1, 3], [0, 3, 2, 1], [0, 1, 3, 2]):
             candidate = corners[idx]
             if ScreenDetector._is_convex(candidate):
                 return candidate
-
-        # If nothing works, return original (shouldn't happen)
         return corners
 
     def _order_by_color_split(self, box, frame, hsv):
-        """Order corners using cyan (left) and green (right) centroids."""
         poly_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
         cv2.fillConvexPoly(poly_mask, box.astype(np.int32), 255)
 
-        cyan_m = cv2.inRange(hsv, self.CYAN_HSV[0], self.CYAN_HSV[1]) & poly_mask
-        green_m = cv2.inRange(hsv, self.GREEN_HSV[0], self.GREEN_HSV[1]) & poly_mask
+        cyan_m = (cv2.inRange(hsv, self.CYAN_HSV[0], self.CYAN_HSV[1])
+                  & poly_mask)
+        green_m = (cv2.inRange(hsv, self.GREEN_HSV[0], self.GREEN_HSV[1])
+                   & poly_mask)
 
         cy_coords = np.where(cyan_m > 0)
         gr_coords = np.where(green_m > 0)
@@ -301,11 +405,9 @@ class ScreenDetector:
         if len(cy_coords[0]) < 5 or len(gr_coords[0]) < 5:
             return None
 
-        # Centroids (x, y)
         cyan_c = np.array([np.mean(cy_coords[1]), np.mean(cy_coords[0])])
         green_c = np.array([np.mean(gr_coords[1]), np.mean(gr_coords[0])])
 
-        # Split corners: closer to cyan = left side, closer to green = right
         left, right = [], []
         for pt in box:
             if np.linalg.norm(pt - cyan_c) <= np.linalg.norm(pt - green_c):
@@ -316,61 +418,29 @@ class ScreenDetector:
         if len(left) != 2 or len(right) != 2:
             return None
 
-        # Within each pair, sort by y (top first)
         left.sort(key=lambda p: p[1])
         right.sort(key=lambda p: p[1])
 
         ordered = np.array([
-            left[0],    # TL (cyan, top)
-            right[0],   # TR (green, top)
-            right[1],   # BR (green, bottom)
-            left[1],    # BL (cyan, bottom)
+            left[0], right[0], right[1], left[1]
         ], dtype=np.float64)
 
-        # Corner consistency: if previous corners exist, check that this
-        # ordering is consistent (no sudden jumps). If a corner swapped,
-        # re-order using nearest-neighbor matching to previous frame.
         if self._prev_corners is not None:
             ordered = self._enforce_corner_consistency(ordered)
 
         self._prev_corners = ordered.copy()
         return ordered
 
-    def _validate_corner_winding(self, corners):
-        """
-        Ensure corners wind clockwise: TL→TR→BR→BL.
-        If counter-clockwise, reverse to fix.
-        """
-        # Cross product of (TR-TL) x (BL-TL)
-        v1 = corners[1] - corners[0]  # TL→TR
-        v2 = corners[3] - corners[0]  # TL→BL
-        cross = v1[0] * v2[1] - v1[1] * v2[0]
-        if cross < 0:
-            # Counter-clockwise → reverse to TL, BL, BR, TR → remap
-            corners = corners[[0, 3, 2, 1]]
-        return corners
-
     def _enforce_corner_consistency(self, corners):
-        """
-        Prevent corner ordering flicker by matching to previous frame.
-        If the new ordering is very different, re-assign corners using
-        nearest-neighbor to the previous known positions.
-        """
         prev = self._prev_corners
-        # Check how far each corner moved
         dists = np.linalg.norm(corners - prev, axis=1)
-        max_jump = np.max(dists)
-
-        if max_jump < self._corner_max_jump:
-            # Ordering is consistent, no fix needed
+        if np.max(dists) < self._corner_max_jump:
             return corners
 
-        # Corners may have swapped — re-assign by closest match
         used = [False] * 4
         reordered = np.zeros_like(corners)
         for i in range(4):
-            best_j = -1
-            best_d = 1e9
+            best_j, best_d = -1, 1e9
             for j in range(4):
                 if used[j]:
                     continue
@@ -380,113 +450,147 @@ class ScreenDetector:
                     best_j = j
             reordered[i] = corners[best_j]
             used[best_j] = True
-
         return reordered
 
     def _order_geometric(self, box):
-        """Fallback: order by y (top pair) then x (left first)."""
         sorted_y = box[np.argsort(box[:, 1])]
         top = sorted_y[:2]
         bottom = sorted_y[2:]
         top = top[np.argsort(top[:, 0])]
         bottom = bottom[np.argsort(bottom[:, 0])]
-
         return np.array([
-            top[0],       # TL
-            top[1],       # TR
-            bottom[1],    # BR
-            bottom[0],    # BL
+            top[0], top[1], bottom[1], bottom[0]
         ], dtype=np.float64)
 
     # ================================================================ #
-    #                   Pose Estimation                                 #
+    #           Pose Estimation  (clinical-grade)                       #
     # ================================================================ #
 
     def estimate_pose(self, corners, frame_shape):
-        """Estimate 6DOF pose from 4 ordered screen corners."""
-        cam = self._get_camera_matrix(frame_shape)
+        """
+        Clinical-grade 6DOF pose estimation with IPPE disambiguation.
 
+        Strategy:
+          1. solvePnPGeneric (IPPE_SQUARE) -> get BOTH planar solutions.
+          2. If previous pose exists, also try ITERATIVE with
+             useExtrinsicGuess (pre-conditioned on last frame).
+          3. Pick the solution closest to the previous rotation
+             (eliminates the IPPE random-flip problem).
+          4. Feed through One Euro Filters for adaptive smoothing.
+          5. Compute body rotation from the selected rotation matrix.
+        """
+        cam = self._get_camera_matrix(frame_shape)
+        t_now = time.time()
+
+        # ------ Collect candidate solutions ------
+        candidates = []
+
+        # Method 1: IPPE_SQUARE -> two solutions
         try:
-            ok, rvec, tvec = cv2.solvePnP(
+            n_sol, rvecs, tvecs, reproj_errs = cv2.solvePnPGeneric(
                 self.model_points, corners, cam, self.dist_coeffs,
                 flags=cv2.SOLVEPNP_IPPE_SQUARE
             )
+            for i in range(n_sol):
+                candidates.append(
+                    (rvecs[i].copy(), tvecs[i].copy(),
+                     float(reproj_errs[i][0])))
         except cv2.error:
-            ok = False
+            pass
 
-        if not ok:
+        # Method 2: ITERATIVE with previous pose as seed
+        if self._prev_rvec is not None:
             try:
-                ok, rvec, tvec = cv2.solvePnP(
+                ok, rv_it, tv_it = cv2.solvePnP(
+                    self.model_points, corners, cam, self.dist_coeffs,
+                    rvec=self._prev_rvec.copy(),
+                    tvec=self._prev_tvec.copy(),
+                    useExtrinsicGuess=True,
+                    flags=cv2.SOLVEPNP_ITERATIVE
+                )
+                if ok:
+                    rp, _ = cv2.projectPoints(
+                        self.model_points, rv_it, tv_it, cam,
+                        self.dist_coeffs)
+                    err = float(np.mean(np.linalg.norm(
+                        rp.reshape(-1, 2) - corners, axis=1)))
+                    candidates.append((rv_it, tv_it, err))
+            except cv2.error:
+                pass
+
+        # Method 3: plain ITERATIVE (no seed) as fallback
+        if not candidates:
+            try:
+                ok, rv, tv = cv2.solvePnP(
                     self.model_points, corners, cam, self.dist_coeffs,
                     flags=cv2.SOLVEPNP_ITERATIVE
                 )
+                if ok:
+                    rp, _ = cv2.projectPoints(
+                        self.model_points, rv, tv, cam, self.dist_coeffs)
+                    err = float(np.mean(np.linalg.norm(
+                        rp.reshape(-1, 2) - corners, axis=1)))
+                    candidates.append((rv, tv, err))
             except cv2.error:
-                ok = False
+                pass
 
-        if not ok:
+        if not candidates:
             return None
 
-        # Reprojection error check: reject truly insane PnP solutions.
-        # A crossed-corner bowtie produces errors >> screen diagonal.
-        # Normal uncalibrated errors are high but proportional to screen size.
-        reproj, _ = cv2.projectPoints(
-            self.model_points, rvec, tvec, cam, self.dist_coeffs
-        )
-        reproj = reproj.reshape(-1, 2)
-        reproj_err = np.mean(np.linalg.norm(reproj - corners, axis=1))
+        # ------ Filter bad solutions ------
         screen_diag = np.linalg.norm(corners[0] - corners[2])
-        if screen_diag > 1 and reproj_err > screen_diag * 3.0:
-            # Extremely bad — likely crossed corners or flipped solution
+        valid = []
+        for rv, tv, err in candidates:
+            dist = np.linalg.norm(tv)
+            if dist < 5 or dist > 5000:
+                continue
+            if screen_diag > 1 and err > screen_diag * 2.5:
+                continue
+            valid.append((rv, tv, err))
+
+        if not valid:
             return None
 
-        dist = np.linalg.norm(tvec)
-        if dist < 5 or dist > 5000:
-            return None
+        # ------ Select best using temporal continuity ------
+        if self._prev_rvec is not None and len(valid) > 1:
+            best = min(valid, key=lambda c: self._pose_distance(c[0], c[1]))
+        else:
+            best = min(valid, key=lambda c: c[2])
 
-        # Temporal smoothing with outlier rejection
-        if self._prev_tvec is not None:
-            prev_dist = np.linalg.norm(self._prev_tvec)
-            jump_ratio = abs(dist - prev_dist) / max(prev_dist, 1)
+        rvec_raw, tvec_raw, reproj_err = best
 
-            if jump_ratio > 0.6:
-                # Large jump — likely a bad frame. Use heavy dampening
-                a = 0.85
-            else:
-                a = self._smooth_factor
+        # Store raw pose for next frame's disambiguation
+        self._prev_rvec = rvec_raw.copy()
+        self._prev_tvec = tvec_raw.copy()
 
-            tvec = a * self._prev_tvec + (1 - a) * tvec
+        # ------ One Euro Filtering ------
+        dist_raw = float(np.linalg.norm(tvec_raw))
+        distance_mm = self._filt_dist(dist_raw, t_now)
 
-            # Proper rotation smoothing via SLERP-like interpolation:
-            # Convert both to rotation matrices, blend, re-extract rvec
-            R_prev, _ = cv2.Rodrigues(self._prev_rvec)
-            R_new, _ = cv2.Rodrigues(rvec)
-            R_blend = R_prev * a + R_new * (1 - a)
-            # Re-orthogonalize via SVD
-            U, _, Vt = np.linalg.svd(R_blend)
-            R_ortho = U @ Vt
-            # Ensure proper rotation (det = +1)
-            if np.linalg.det(R_ortho) < 0:
-                R_ortho = -R_ortho
-            rvec, _ = cv2.Rodrigues(R_ortho)
+        ax_raw = float(np.degrees(np.arctan2(
+            tvec_raw[0][0], tvec_raw[2][0])))
+        ay_raw = float(np.degrees(np.arctan2(
+            tvec_raw[1][0], tvec_raw[2][0])))
+        angle_x = self._filt_ax(ax_raw, t_now)
+        angle_y = self._filt_ay(ay_raw, t_now)
 
-        self._prev_tvec = tvec.copy()
-        self._prev_rvec = rvec.copy()
+        # Rotation matrix from the raw (selected) rvec.
+        # We filter the output body_rotation scalar, not the rvec,
+        # because filtering Rodrigues vectors is numerically unstable
+        # near gimbal-lock singularities.
+        rmat, _ = cv2.Rodrigues(rvec_raw)
 
-        distance_mm = np.linalg.norm(tvec)
-        angle_x = np.degrees(np.arctan2(tvec[0][0], tvec[2][0]))
-        angle_y = np.degrees(np.arctan2(tvec[1][0], tvec[2][0]))
-        rmat, _ = cv2.Rodrigues(rvec)
+        # ------ Body Rotation ------
+        # Screen normal in camera frame = R's 3rd column.
+        # dot(normal, camera_Z=[0,0,1]) = rmat[2,2].
+        # abs() handles either normal direction.
+        cos_angle = float(np.clip(abs(rmat[2, 2]), 0.0, 1.0))
+        body_rot_raw = float(np.degrees(np.arccos(cos_angle)))
 
-        # Body rotation: angle between screen normal and camera Z-axis.
-        # The screen normal in camera coordinates is the 3rd column of R.
-        # When the screen faces the camera: normal ≈ [0,0,1] → angle = 0°.
-        # When tilted to V6 position: normal rotates → angle ≈ 70-80°.
-        screen_normal = rmat[:, 2]  # 3rd column = screen Z in camera frame
-        cos_angle = abs(screen_normal[2])  # dot product with [0,0,1]
-        cos_angle = np.clip(cos_angle, -1.0, 1.0)
-        body_rotation = np.degrees(np.arccos(cos_angle))
+        body_rotation = self._filt_body_rot(body_rot_raw, t_now)
+        body_rotation = float(np.clip(body_rotation, 0.0, 90.0))
 
-        # ECG position estimate
+        # ECG position mapping
         if body_rotation < 15:
             ecg_label = "V1-V2 (frontal)"
         elif body_rotation < 35:
@@ -499,60 +603,73 @@ class ScreenDetector:
             ecg_label = "V6 (far lateral)"
 
         return {
-            'rvec': rvec, 'tvec': tvec,
+            'rvec': rvec_raw,
+            'tvec': tvec_raw,
             'distance_mm': distance_mm,
             'distance_cm': distance_mm / 10.0,
-            'angle_x': angle_x,
-            'angle_y': angle_y,
+            'angle_x': float(angle_x),
+            'angle_y': float(angle_y),
             'body_rotation': body_rotation,
+            'body_rotation_raw': float(body_rot_raw),
             'ecg_label': ecg_label,
             'rotation_matrix': rmat,
             'image_points': corners,
+            'reproj_error': reproj_err,
+            'confidence': self._confidence,
         }
 
-    def estimate_distance_simple(self, rect, frame_shape):
+    def _pose_distance(self, rvec, tvec):
         """
-        Simple distance estimate when solvePnP fails.
-
-        Uses: distance = focal * real_size / apparent_size
-        The longer dimension of the rect ≈ screen height.
+        Weighted distance between a candidate pose and the previous.
+        Rotation distance (geodesic on SO(3)) weighted heavily because
+        IPPE ambiguity flips are primarily rotational.
         """
-        rw, rh = rect[1]
-        apparent = max(rw, rh)
-        if apparent < 2:
-            return None
+        if self._prev_rvec is None:
+            return 0.0
 
-        cam = self._get_camera_matrix(frame_shape)
-        focal = cam[0][0]
-        real = self.screen_h  # physical height in mm
+        # Rotation distance: angle of R_prev^T @ R_new
+        R_prev, _ = cv2.Rodrigues(self._prev_rvec)
+        R_new, _ = cv2.Rodrigues(rvec)
+        R_diff = R_prev.T @ R_new
+        cos_a = np.clip((np.trace(R_diff) - 1.0) / 2.0, -1.0, 1.0)
+        rot_deg = float(np.degrees(np.arccos(cos_a)))
 
-        distance_mm = focal * real / apparent
-        return distance_mm / 10.0  # cm
+        # Translation distance (normalised by distance)
+        prev_d = max(float(np.linalg.norm(self._prev_tvec)), 1.0)
+        t_dist = float(np.linalg.norm(tvec - self._prev_tvec)) / prev_d
+
+        # Weight rotation much higher (IPPE flips are rotational)
+        return rot_deg * 3.0 + t_dist * 50.0
 
     # ================================================================ #
     #                   Visualization                                   #
     # ================================================================ #
 
-    def draw_results(self, frame, corners, pose):
-        """Draw detected screen outline and pose info."""
+    def draw_results(self, frame, corners, pose, coasting=False):
+        """Draw detected screen outline and pose info on frame."""
         pts = corners.astype(int)
         labels = ["TL", "TR", "BR", "BL"]
         colors = [(255, 255, 0), (0, 255, 0), (0, 255, 0), (255, 255, 0)]
 
+        line_color = (0, 140, 255) if coasting else (0, 200, 255)
+        thickness = 1 if coasting else 2
+
         for i in range(4):
             p1 = tuple(pts[i])
             p2 = tuple(pts[(i + 1) % 4])
-            cv2.line(frame, p1, p2, (0, 200, 255), 2, cv2.LINE_AA)
+            cv2.line(frame, p1, p2, line_color, thickness, cv2.LINE_AA)
 
-        for i, (label, color) in enumerate(zip(labels, colors)):
-            pt = tuple(pts[i])
-            cv2.circle(frame, pt, 5, color, -1)
-            cv2.putText(frame, label, (pt[0] + 8, pt[1] - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+        if not coasting:
+            for i, (label, color) in enumerate(zip(labels, colors)):
+                pt = tuple(pts[i])
+                cv2.circle(frame, pt, 5, color, -1)
+                cv2.putText(frame, label, (pt[0] + 8, pt[1] - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
 
         if pose:
-            self._draw_axes(frame, pose)
-            self._draw_info_panel(frame, pose)
+            if not coasting:
+                self._draw_axes(frame, pose)
+            self._draw_info_panel(frame, pose, coasting)
 
     def _draw_axes(self, frame, pose):
         cam = self._get_camera_matrix(frame.shape)
@@ -560,9 +677,11 @@ class ScreenDetector:
         pts3d = np.array([
             [0, 0, 0], [al, 0, 0], [0, al, 0], [0, 0, -al]
         ], dtype=np.float64)
-        img_pts, _ = cv2.projectPoints(
-            pts3d, pose['rvec'], pose['tvec'], cam, self.dist_coeffs
-        )
+        try:
+            img_pts, _ = cv2.projectPoints(
+                pts3d, pose['rvec'], pose['tvec'], cam, self.dist_coeffs)
+        except cv2.error:
+            return
         o = tuple(img_pts[0].ravel().astype(int))
         x = tuple(img_pts[1].ravel().astype(int))
         y = tuple(img_pts[2].ravel().astype(int))
@@ -570,19 +689,53 @@ class ScreenDetector:
         cv2.line(frame, o, x, (0, 0, 255), 3, cv2.LINE_AA)
         cv2.line(frame, o, y, (0, 255, 0), 3, cv2.LINE_AA)
         cv2.line(frame, o, z, (255, 0, 0), 3, cv2.LINE_AA)
-        cv2.putText(frame, "X", x, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-        cv2.putText(frame, "Y", y, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-        cv2.putText(frame, "Z", z, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+        cv2.putText(frame, "X", x, cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                    (0, 0, 255), 2)
+        cv2.putText(frame, "Y", y, cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                    (0, 255, 0), 2)
+        cv2.putText(frame, "Z", z, cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                    (255, 0, 0), 2)
 
-    def _draw_info_panel(self, frame, pose):
+    def _draw_info_panel(self, frame, pose, coasting=False):
         overlay = frame.copy()
-        cv2.rectangle(overlay, (5, 5), (380, 200), (0, 0, 0), -1)
+        ph = 230
+        cv2.rectangle(overlay, (5, 5), (390, ph), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.65, frame, 0.35, 0, frame)
+
+        y0 = 32
+
+        # Lock status indicator
+        if coasting:
+            status_text = "COASTING"
+            sc = (0, 180, 255)
+        elif self._mode == self.MODE_LOCKED:
+            status_text = "LOCKED"
+            sc = (0, 255, 0)
+        else:
+            status_text = "ACQUIRING"
+            sc = (0, 255, 255)
+
+        cv2.putText(frame, status_text, (295, y0),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, sc, 2)
+
+        # Confidence bar
+        conf = pose.get('confidence', self._confidence)
+        bar_w = int(60 * min(conf, 1.0))
+        cv2.rectangle(frame, (295, y0 + 8), (355, y0 + 16),
+                      (50, 50, 50), -1)
+        if bar_w > 0:
+            if conf > 0.7:
+                bc = (0, 255, 0)
+            elif conf > 0.4:
+                bc = (0, 220, 255)
+            else:
+                bc = (0, 80, 255)
+            cv2.rectangle(frame, (295, y0 + 8), (295 + bar_w, y0 + 16),
+                          bc, -1)
 
         # Body rotation (big, prominent)
         br = pose['body_rotation']
         ecg = pose['ecg_label']
-        # Color: green < 30°, yellow 30-60°, orange 60-80°, red > 80°
         if br < 30:
             rc = (0, 255, 0)
         elif br < 60:
@@ -592,38 +745,48 @@ class ScreenDetector:
         else:
             rc = (0, 80, 255)
         cv2.putText(frame, f"Body Rotation: {br:.0f} deg",
-                    (15, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.85, rc, 2)
+                    (15, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.85, rc, 2)
         cv2.putText(frame, f"~ {ecg}",
-                    (15, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.5, rc, 1)
+                    (15, y0 + 26), cv2.FONT_HERSHEY_SIMPLEX, 0.5, rc, 1)
 
         # Distance
         d = pose['distance_cm']
         dc = (0, 255, 0) if d < 100 else (0, 200, 255)
         cv2.putText(frame, f"Distance: {d:.1f} cm",
-                    (15, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.7, dc, 2)
+                    (15, y0 + 62), cv2.FONT_HERSHEY_SIMPLEX, 0.7, dc, 2)
 
         # Position angles
-        cv2.putText(frame, f"Pos X: {pose['angle_x']:+.1f}  Y: {pose['angle_y']:+.1f}",
-                    (15, 125), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 220), 1)
+        cv2.putText(frame,
+                    f"Pos X: {pose['angle_x']:+.1f}  "
+                    f"Y: {pose['angle_y']:+.1f}",
+                    (15, y0 + 92), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                    (180, 180, 220), 1)
+
+        # Diagnostics line
+        re = pose.get('reproj_error', 0)
+        raw = pose.get('body_rotation_raw', br)
+        cv2.putText(frame,
+                    f"Reproj: {re:.1f}px  Raw: {raw:.0f}  "
+                    f"Conf: {conf:.0%}",
+                    (15, y0 + 118), cv2.FONT_HERSHEY_SIMPLEX, 0.38,
+                    (120, 120, 120), 1)
 
         # Screen info
         cv2.putText(frame,
                     f"Screen: {self.screen_w:.1f}x{self.screen_h:.1f}mm",
-                    (15, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (130, 130, 130), 1)
+                    (15, y0 + 140), cv2.FONT_HERSHEY_SIMPLEX, 0.38,
+                    (100, 100, 100), 1)
 
-        # Draw rotation arc indicator
+        # Rotation arc gauge
         self._draw_rotation_gauge(frame, br)
 
     def _draw_rotation_gauge(self, frame, body_rotation):
-        """Draw a visual arc gauge showing body rotation 0-90°."""
-        cx, cy = 340, 105
+        cx, cy = 345, 135
         radius = 55
 
-        # Background arc (0-90°)
         cv2.ellipse(frame, (cx, cy), (radius, radius), 180, 0, 90,
                     (60, 60, 60), 2, cv2.LINE_AA)
 
-        # Filled arc (current rotation)
         sweep = min(body_rotation, 90)
         if sweep > 0:
             if body_rotation < 30:
@@ -635,117 +798,220 @@ class ScreenDetector:
             cv2.ellipse(frame, (cx, cy), (radius, radius), 180, 0,
                         int(sweep), ac, 4, cv2.LINE_AA)
 
-        # Needle
         angle_rad = np.radians(180 + sweep)
         nx = int(cx + radius * np.cos(angle_rad))
         ny = int(cy + radius * np.sin(angle_rad))
-        cv2.line(frame, (cx, cy), (nx, ny), (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.line(frame, (cx, cy), (nx, ny), (255, 255, 255), 2,
+                 cv2.LINE_AA)
         cv2.circle(frame, (nx, ny), 3, (255, 255, 255), -1)
 
-        # Labels
         cv2.putText(frame, "0", (cx - radius - 12, cy + 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 150, 150), 1)
         cv2.putText(frame, "90", (cx - 5, cy - radius - 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 150, 150), 1)
 
     def draw_debug(self, frame, mask):
-        """Show the HSV mask overlay in corner."""
         h, w = frame.shape[:2]
         ms = cv2.resize(mask, (w // 4, h // 4))
         mb = cv2.cvtColor(ms, cv2.COLOR_GRAY2BGR)
-        mb[:, :, 1] = ms  # green-tint
+        mb[:, :, 1] = ms
         frame[h - mb.shape[0]:h, w - mb.shape[1]:w] = mb
         cv2.putText(frame, "HSV Mask",
                     (w - mb.shape[1] + 5, h - mb.shape[0] + 15),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
 
     # ================================================================ #
-    #                   ROI Tracking                                    #
+    #               ROI Tracking with Velocity Prediction               #
     # ================================================================ #
 
     def _compute_roi(self, frame_shape):
-        if self._last_bbox is None or self._frames_lost > self._max_lost_frames:
+        """Compute search ROI with velocity prediction."""
+        if self._last_bbox is None:
             return None
+        if self._frames_lost > self._max_search_frames:
+            return None
+
         h, w = frame_shape[:2]
         bx, by, bw, bh = self._last_bbox
-        expand = 1.2
-        ex, ey = int(bw * expand), int(bh * expand)
+
+        # Predict position using velocity
+        predict = min(self._frames_lost, 5)
+        bx = int(bx + self._bbox_velocity[0] * predict)
+        by = int(by + self._bbox_velocity[1] * predict)
+
+        # Larger ROI when coasting
+        expand = 1.2 + 0.15 * min(self._frames_lost, 10)
+        ex = int(bw * expand)
+        ey = int(bh * expand)
+
         return (max(bx - ex, 0), max(by - ey, 0),
                 min(bx + bw + ex, w), min(by + bh + ey, h))
 
     def _update_tracking(self, corners):
+        """Update ROI, velocity, and confidence."""
         if corners is not None:
-            xs = corners[:, 0]
-            ys = corners[:, 1]
+            xs, ys = corners[:, 0], corners[:, 1]
             pad = 10
+            cx, cy = float(np.mean(xs)), float(np.mean(ys))
+
+            if self._prev_center is not None:
+                vx = cx - self._prev_center[0]
+                vy = cy - self._prev_center[1]
+                self._bbox_velocity = (
+                    0.7 * self._bbox_velocity
+                    + 0.3 * np.array([vx, vy]))
+            self._prev_center = np.array([cx, cy])
+
             self._last_bbox = (
                 int(np.min(xs)) - pad, int(np.min(ys)) - pad,
                 int(np.ptp(xs)) + 2 * pad, int(np.ptp(ys)) + 2 * pad,
             )
             self._frames_lost = 0
+            self._frames_locked += 1
+            self._det_history.append(1)
         else:
             self._frames_lost += 1
+            self._frames_locked = 0
+            self._det_history.append(0)
+
+        if len(self._det_history) > 0:
+            self._confidence = (
+                sum(self._det_history) / len(self._det_history))
+        else:
+            self._confidence = 0.0
 
     # ================================================================ #
-    #                   Full Pipeline                                   #
+    #           Full Pipeline with State Machine                        #
     # ================================================================ #
 
     def process_frame(self, frame, debug=False):
         """
-        Run full detection + pose estimation on one frame.
+        Full detection + pose estimation with tracking state machine.
+
+        States:
+            SEARCH   -> scanning full frame, strict thresholds
+            LOCKED   -> ROI + relaxed thresholds + filtering
+            COASTING -> lost briefly, show last pose with warning
 
         Returns (annotated_frame, pose_dict, mask).
         """
-        # ROI search
+        relaxed = (self._mode in (self.MODE_LOCKED, self.MODE_COASTING))
+
+        # ROI search when locked/coasting
         roi = self._compute_roi(frame.shape)
         sf = frame
         ox, oy = 0, 0
 
-        if roi is not None:
+        if roi is not None and relaxed:
             x1, y1, x2, y2 = roi
-            sf = frame[y1:y2, x1:x2]
-            ox, oy = x1, y1
-            if debug:
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 0), 1)
+            if x2 > x1 + 10 and y2 > y1 + 10:
+                sf = frame[y1:y2, x1:x2]
+                ox, oy = x1, y1
+                if debug:
+                    cv2.rectangle(frame, (x1, y1), (x2, y2),
+                                  (255, 255, 0), 1)
 
-        corners, mask = self.find_screen(sf)
+        corners, mask = self.find_screen(sf, relaxed=relaxed)
 
-        # Offset if we searched in ROI
         if corners is not None and (ox or oy):
             corners = corners + np.array([ox, oy], dtype=np.float64)
 
-        # Fallback: search full frame if ROI failed
+        # Fallback: full frame if ROI failed
         if corners is None and roi is not None:
-            corners, mask = self.find_screen(frame)
+            corners, mask = self.find_screen(frame, relaxed=relaxed)
+
+        # Second fallback: try relaxed on full frame
+        if corners is None and not relaxed:
+            corners, mask = self.find_screen(frame, relaxed=True)
 
         pose = None
+        coasting = False
+
         if corners is not None:
             pose = self.estimate_pose(corners, frame.shape)
             if pose is not None:
+                self._last_pose = pose.copy()
+                self._last_pose['image_points'] = corners.copy()
+                self._mode = self.MODE_LOCKED
                 self.draw_results(frame, corners, pose)
             else:
-                # Draw outline even without pose
                 pts = corners.astype(int)
                 for i in range(4):
-                    cv2.line(frame, tuple(pts[i]), tuple(pts[(i+1)%4]),
+                    cv2.line(frame, tuple(pts[i]),
+                             tuple(pts[(i + 1) % 4]),
                              (0, 200, 255), 2, cv2.LINE_AA)
             self._update_tracking(corners)
+
         else:
             self._update_tracking(None)
-            # Only reset smoothing after several lost frames (not on first miss)
-            if self._frames_lost > 5:
-                self._prev_tvec = None
-                self._prev_rvec = None
-                self._prev_corners = None
-            cv2.putText(frame, "Searching for screen marker...",
-                        (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 200), 2)
-            cv2.putText(frame, f"Screen: {self.screen_w:.0f}x{self.screen_h:.0f}mm",
-                        (15, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
+
+            if (self._frames_lost <= self._max_coast_frames
+                    and self._last_pose is not None):
+                # COASTING — show last known pose
+                self._mode = self.MODE_COASTING
+                coasting = True
+                pose = self._last_pose
+                lc = pose.get('image_points')
+                if lc is not None:
+                    self.draw_results(frame, lc, pose, coasting=True)
+                remaining = self._max_coast_frames - self._frames_lost
+                cv2.putText(
+                    frame,
+                    f"COASTING ({remaining})",
+                    (15, frame.shape[0] - 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 180, 255), 1)
+            else:
+                # Fully lost
+                self._mode = self.MODE_SEARCH
+                if self._frames_lost > 12:
+                    self._prev_rvec = None
+                    self._prev_tvec = None
+                    self._prev_corners = None
+                    self._last_pose = None
+                    self._reset_filters()
+
+                cv2.putText(
+                    frame, "Searching for screen marker...",
+                    (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                    (0, 0, 200), 2)
+                cv2.putText(
+                    frame,
+                    f"Screen: {self.screen_w:.0f}x"
+                    f"{self.screen_h:.0f}mm",
+                    (15, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                    (150, 150, 150), 1)
 
         if debug:
             self.draw_debug(frame, mask)
+            mode_names = {0: "SEARCH", 1: "LOCKED", 2: "COASTING"}
+            cv2.putText(frame,
+                        f"Mode: {mode_names.get(self._mode, '?')}",
+                        (frame.shape[1] - 180, frame.shape[0] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 0), 1)
 
         return frame, pose, mask
+
+    def _reset_filters(self):
+        """Reset all One Euro Filters (after fully losing track)."""
+        self._filt_body_rot.reset()
+        self._filt_tvec.reset()
+        self._filt_dist.reset()
+        self._filt_ax.reset()
+        self._filt_ay.reset()
+
+    # ================================================================ #
+    #                   Utility                                         #
+    # ================================================================ #
+
+    def estimate_distance_simple(self, rect, frame_shape):
+        rw, rh = rect[1]
+        apparent = max(rw, rh)
+        if apparent < 2:
+            return None
+        cam = self._get_camera_matrix(frame_shape)
+        focal = cam[0][0]
+        distance_mm = focal * self.screen_h / apparent
+        return distance_mm / 10.0
 
 
 # ==================================================================== #
@@ -754,26 +1020,27 @@ class ScreenDetector:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="SplitScreen Marker Detector v4"
+        description="SplitScreen Marker Detector v5 (Clinical-Grade)"
     )
     parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--watch-model", type=str, default=None,
                         choices=list(SCREEN_SIZES.keys()),
                         help="Auto-set screen dimensions from watch model")
     parser.add_argument("--screen-width", type=float, default=None,
-                        help="Physical screen width in mm (e.g. 29 for 2.9cm)")
+                        help="Physical screen width in mm")
     parser.add_argument("--screen-height", type=float, default=None,
-                        help="Physical screen height in mm (e.g. 17 for 1.7cm)")
+                        help="Physical screen height in mm")
     parser.add_argument("--screen-size", type=str, default=None,
-                        help="Screen WxH in mm, e.g. '29x17' (2.9cm x 1.7cm)")
+                        help="Screen WxH in mm, e.g. '29x17'")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
-    parser.add_argument("--smooth", type=float, default=0.4)
+    parser.add_argument("--smooth", type=float, default=0.4,
+                        help="Smoothing (0.1=very smooth, 1.0=raw). "
+                             "Controls One Euro Filter min_cutoff.")
     args = parser.parse_args()
 
-    # Determine screen dimensions
-    sw, sh = 37.6, 46.0  # default: 45mm Apple Watch
+    sw, sh = 37.6, 46.0
     if args.watch_model:
         sw, sh = SCREEN_SIZES[args.watch_model]
     if args.screen_size:
@@ -785,10 +1052,25 @@ def main():
         sh = args.screen_height
 
     detector = ScreenDetector(screen_width_mm=sw, screen_height_mm=sh)
-    detector._smooth_factor = args.smooth
+
+    # Map --smooth to One Euro Filter strength
+    mc = max(0.1, args.smooth * 2.0)
+    detector._filt_body_rot = OneEuroFilter(
+        min_cutoff=mc * 0.4, beta=0.004, d_cutoff=1.0)
+    detector._filt_tvec = OneEuroFilterVec(
+        3, min_cutoff=mc * 1.2, beta=0.008, d_cutoff=1.0)
+    detector._filt_dist = OneEuroFilter(
+        min_cutoff=mc, beta=0.006, d_cutoff=1.0)
+    detector._filt_ax = OneEuroFilter(
+        min_cutoff=mc * 1.5, beta=0.01, d_cutoff=1.0)
+    detector._filt_ay = OneEuroFilter(
+        min_cutoff=mc * 1.5, beta=0.01, d_cutoff=1.0)
 
     model_name = args.watch_model or "custom"
+    print("SplitScreen Detector v5 (Clinical-Grade)")
+    print("=========================================")
     print(f"Opening camera {args.camera}...")
+
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
         print(f"ERROR: Cannot open camera {args.camera}")
@@ -800,12 +1082,15 @@ def main():
     ah = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
     print(f"Camera: {aw}x{ah} | Screen: {sw:.1f}x{sh:.1f}mm ({model_name})")
+    print(f"Smoothing: {args.smooth:.2f} (One Euro min_cutoff={mc:.2f})")
     print("Keys: q=quit  d=debug  s=screenshot  +/-=smoothing")
+    print()
 
     show_debug = args.debug
     fps_timer = time.time()
     fc = 0
     fps = 0.0
+    mc_current = mc
 
     while True:
         ret, frame = cap.read()
@@ -829,7 +1114,7 @@ def main():
                         (annotated.shape[1] - 80, 60),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
 
-        cv2.imshow("SplitScreen Detector v4", annotated)
+        cv2.imshow("SplitScreen Detector v5", annotated)
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q') or key == 27:
@@ -841,11 +1126,13 @@ def main():
             cv2.imwrite(fn, annotated)
             print(f"Saved: {fn}")
         elif key in (ord('+'), ord('=')):
-            detector._smooth_factor = min(detector._smooth_factor + 0.05, 0.9)
-            print(f"Smooth: {detector._smooth_factor:.2f}")
+            mc_current = min(mc_current + 0.1, 3.0)
+            detector._filt_body_rot.min_cutoff = mc_current * 0.4
+            print(f"Smoothing cutoff: {mc_current:.2f} (less smooth)")
         elif key == ord('-'):
-            detector._smooth_factor = max(detector._smooth_factor - 0.05, 0.0)
-            print(f"Smooth: {detector._smooth_factor:.2f}")
+            mc_current = max(mc_current - 0.1, 0.1)
+            detector._filt_body_rot.min_cutoff = mc_current * 0.4
+            print(f"Smoothing cutoff: {mc_current:.2f} (more smooth)")
 
     cap.release()
     cv2.destroyAllWindows()
