@@ -163,6 +163,10 @@ class ScreenDetector:
         self.screen_w = screen_width_mm
         self.screen_h = screen_height_mm
 
+        # Expected aspect ratio of screen (for scoring)
+        self._expected_aspect = (min(screen_width_mm, screen_height_mm)
+                                 / max(screen_width_mm, screen_height_mm))
+
         W, H = screen_width_mm, screen_height_mm
         self.model_points = np.array([
             [0, 0, 0],      # TL (cyan side, top)
@@ -353,13 +357,65 @@ class ScreenDetector:
                         or size_ratio < 1.0 / self._area_ratio_max):
                     continue
 
-            score = area * rectangularity
+            # ===== MULTI-FACTOR SCORING =====
+            # The old `area * rectangularity` let big background blobs
+            # dominate. The new score uses what makes our marker UNIQUE:
+            # a bright rectangle with the right aspect ratio and a
+            # spatially-separated left-right cyan/green split.
+
+            # 1) Aspect ratio closeness to expected watch screen shape
+            aspect_err = abs(aspect - self._expected_aspect)
+            aspect_err_rel = aspect_err / max(self._expected_aspect, 0.01)
+            aspect_score = max(0.0, 1.0 - aspect_err_rel * 2.0)
+
+            # 2) Colour split balance (ideal = 50/50 cyan:green)
+            total_c = cyan_in + green_in
+            balance_score = 0.0
+            if total_c > 5:
+                balance = min(cyan_in, green_in) / total_c
+                balance_score = min(balance * 2.0, 1.0)
+
+            # 3) SPATIAL split: cyan and green on OPPOSITE sides.
+            #    This is THE key differentiator vs random reflections
+            #    where colours are randomly mixed.
+            spatial_score = 0.0
+            cy_roi = cv2.bitwise_and(
+                cyan_full[by:by2, bx:bx2], small_mask)
+            gr_roi = cv2.bitwise_and(
+                green_full[by:by2, bx:bx2], small_mask)
+            cy_xs = np.where(cy_roi > 0)[1]
+            gr_xs = np.where(gr_roi > 0)[1]
+            if len(cy_xs) >= 3 and len(gr_xs) >= 3:
+                sep = abs(float(np.mean(cy_xs)) - float(np.mean(gr_xs)))
+                spatial_score = min(sep / max(bw_r * 0.25, 1), 1.0)
+
+            # 4) Brightness: OLED is self-emitting (bright), not a
+            #    dim reflection from ambient light.
+            v_roi = hsv[by:by2, bx:bx2, 2]
+            v_in = v_roi[small_mask > 0]
+            mean_v = float(np.mean(v_in)) if len(v_in) > 0 else 0
+            bright_score = min(mean_v / 120.0, 1.0)
+
+            # 5) Colour coverage: what fraction of the blob is our
+            #    colour? Real marker is nearly 100% coloured.
+            coverage = total_c / max(area, 1)
+            coverage_score = min(coverage / 0.7, 1.0)
+
+            # Combine (multiplicative — each factor gates the rest)
+            score = ((0.3 + rectangularity)
+                     * (0.1 + aspect_score * 3.0)      # aspect   huge
+                     * (0.1 + spatial_score * 4.0)      # spatial  huge
+                     * (0.3 + balance_score * 2.0)      # balance  large
+                     * (0.5 + bright_score)              # bright   moderate
+                     * (0.5 + coverage_score)            # coverage moderate
+                     * (1.0 + np.log1p(area) * 0.08))   # area     mild
+
             if has_split:
-                score *= 3.0
+                score *= 2.0
             if has_dark:
-                score *= 1.5
-            if has_weak_split and not has_split:
                 score *= 1.3
+            if has_weak_split and not has_split:
+                score *= 0.7  # weak split is suspicious
 
             if score > best_score:
                 best_score = score
