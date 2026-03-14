@@ -154,8 +154,8 @@ class ScreenDetector:
 
     # --- HSV colour ranges ---
     WIDE_HSV = (np.array([25, 40, 30]), np.array([115, 255, 255]))
-    # Relaxed: slightly wider, but NOT so wide it catches random objects
-    WIDE_HSV_RELAXED = (np.array([20, 30, 20]), np.array([118, 255, 255]))
+    # Relaxed: wider for brightness robustness when locked
+    WIDE_HSV_RELAXED = (np.array([18, 20, 12]), np.array([120, 255, 255]))
     CYAN_HSV = (np.array([78, 50, 20]), np.array([115, 255, 255]))
     GREEN_HSV = (np.array([25, 50, 20]), np.array([76, 255, 255]))
 
@@ -178,7 +178,7 @@ class ScreenDetector:
         self._mode = self.MODE_SEARCH
         self._frames_locked = 0
         self._frames_lost = 0
-        self._max_coast_frames = 8
+        self._max_coast_frames = 12
         self._max_search_frames = 30
 
         # ---- Pose history (raw, before filtering) ----
@@ -215,6 +215,14 @@ class ScreenDetector:
 
         # ---- Running median pre-filter for body rotation ----
         self._rot_buffer = deque(maxlen=5)
+
+        # ---- Corner smoothing (stops bounding box dancing) ----
+        self._filt_corners = OneEuroFilterVec(
+            8, min_cutoff=2.5, beta=0.015, d_cutoff=1.0)
+
+        # ---- Lock confirmation (prevents false lock-on) ----
+        self._confirm_count = 0
+        self._confirm_required = 3
 
         # CLI compat
         self._smooth_factor = 0.4
@@ -261,9 +269,16 @@ class ScreenDetector:
         mask, hsv = self._create_screen_mask(frame, relaxed=relaxed)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
+        # Pre-compute colour masks ONCE (not per-contour — huge speedup)
+        cyan_full = cv2.inRange(hsv, self.CYAN_HSV[0], self.CYAN_HSV[1])
+        green_full = cv2.inRange(hsv, self.GREEN_HSV[0], self.GREEN_HSV[1])
+
         contours, _ = cv2.findContours(
             mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
+
+        # Speed: only examine largest candidates
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:20]
 
         max_frame_area = frame.shape[0] * frame.shape[1] * 0.6
         min_area = 12 if relaxed else 25
@@ -292,16 +307,21 @@ class ScreenDetector:
             if aspect < min_aspect:
                 continue
 
-            # Verify two-colour split
+            # Verify two-colour split (bounding-rect ROI — fast)
             box = cv2.boxPoints(rect).astype(np.int32)
-            poly_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
-            cv2.fillConvexPoly(poly_mask, box, 255)
+            bx, by, bw_r, bh_r = cv2.boundingRect(box)
+            bx = max(bx, 0); by = max(by, 0)
+            bx2 = min(bx + bw_r, frame.shape[1])
+            by2 = min(by + bh_r, frame.shape[0])
+            if bx2 - bx < 2 or by2 - by < 2:
+                continue
+            small_mask = np.zeros((by2 - by, bx2 - bx), dtype=np.uint8)
+            cv2.fillConvexPoly(small_mask, box - [bx, by], 255)
 
-            cyan_m = cv2.inRange(hsv, self.CYAN_HSV[0], self.CYAN_HSV[1])
-            green_m = cv2.inRange(hsv, self.GREEN_HSV[0], self.GREEN_HSV[1])
-
-            cyan_in = np.sum((cyan_m & poly_mask) > 0)
-            green_in = np.sum((green_m & poly_mask) > 0)
+            cyan_in = cv2.countNonZero(
+                cv2.bitwise_and(cyan_full[by:by2, bx:bx2], small_mask))
+            green_in = cv2.countNonZero(
+                cv2.bitwise_and(green_full[by:by2, bx:bx2], small_mask))
 
             split_thr = 0.06 if relaxed else 0.12
             has_split = (cyan_in > area * split_thr
@@ -318,7 +338,7 @@ class ScreenDetector:
                 has_weak_split = (major > area * 0.15
                                   and minor > max(area * 0.02, 3))
 
-            has_dark = self._check_surround(gray, poly_mask)
+            has_dark = self._check_surround(gray, box)
 
             # ALWAYS require some colour evidence — dark surround alone
             # is not enough (too many false positives from dark objects)
@@ -354,18 +374,26 @@ class ScreenDetector:
         ordered = self._order_corners(box, frame, hsv, has_split)
         return ordered, mask
 
-    def _check_surround(self, gray, screen_mask):
+    def _check_surround(self, gray, box_pts):
         """Screen should be brighter than its immediate surround."""
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-        dilated = cv2.dilate(screen_mask, kernel, iterations=1)
-        ring = dilated & ~screen_mask
-
-        screen_px = gray[screen_mask > 0]
-        ring_px = gray[ring > 0]
-
+        bx, by, bw, bh = cv2.boundingRect(box_pts)
+        pad = 12
+        y1, x1 = max(by - pad, 0), max(bx - pad, 0)
+        y2, x2 = (min(by + bh + pad, gray.shape[0]),
+                   min(bx + bw + pad, gray.shape[1]))
+        roi = gray[y1:y2, x1:x2]
+        if roi.size < 25:
+            return True
+        sm = np.zeros(roi.shape, dtype=np.uint8)
+        cv2.fillConvexPoly(sm, box_pts - [x1, y1], 255)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        dilated = cv2.dilate(sm, kernel, iterations=1)
+        ring = dilated & ~sm
+        screen_px = roi[sm > 0]
+        ring_px = roi[ring > 0]
         if len(ring_px) < 5 or len(screen_px) < 5:
             return True
-        return np.median(ring_px) < np.median(screen_px) * 0.75
+        return float(np.median(ring_px)) < float(np.median(screen_px)) * 0.75
 
     # ================================================================ #
     #                   Corner Ordering                                 #
@@ -509,18 +537,24 @@ class ScreenDetector:
         # ------ Collect candidate solutions ------
         candidates = []
 
-        # Method 1: IPPE_SQUARE -> two solutions
-        try:
-            n_sol, rvecs, tvecs, reproj_errs = cv2.solvePnPGeneric(
-                self.model_points, corners, cam, self.dist_coeffs,
-                flags=cv2.SOLVEPNP_IPPE_SQUARE
-            )
-            for i in range(n_sol):
-                candidates.append(
-                    (rvecs[i].copy(), tvecs[i].copy(),
-                     float(reproj_errs[i][0])))
-        except cv2.error:
-            pass
+        # When LOCKED with previous pose, skip IPPE (expensive) and
+        # use ITERATIVE with extrinsic guess directly (much faster).
+        skip_ippe = (self._prev_rvec is not None
+                     and self._mode == self.MODE_LOCKED)
+
+        # Method 1: IPPE_SQUARE -> two solutions (skip when locked)
+        if not skip_ippe:
+            try:
+                n_sol, rvecs, tvecs, reproj_errs = cv2.solvePnPGeneric(
+                    self.model_points, corners, cam, self.dist_coeffs,
+                    flags=cv2.SOLVEPNP_IPPE_SQUARE
+                )
+                for i in range(n_sol):
+                    candidates.append(
+                        (rvecs[i].copy(), tvecs[i].copy(),
+                         float(reproj_errs[i][0])))
+            except cv2.error:
+                pass
 
         # Method 2: ITERATIVE with previous pose as seed
         if self._prev_rvec is not None:
@@ -963,45 +997,69 @@ class ScreenDetector:
 
         Returns (annotated_frame, pose_dict, mask).
         """
-        relaxed = (self._mode in (self.MODE_LOCKED, self.MODE_COASTING))
+        # ---- Detection strategy by mode ----
+        corners = None
+        mask = None
 
-        # ROI search when locked/coasting
-        roi = self._compute_roi(frame.shape)
-        sf = frame
-        ox, oy = 0, 0
-
-        if roi is not None and relaxed:
-            x1, y1, x2, y2 = roi
-            if x2 > x1 + 10 and y2 > y1 + 10:
-                sf = frame[y1:y2, x1:x2]
-                ox, oy = x1, y1
-                if debug:
-                    cv2.rectangle(frame, (x1, y1), (x2, y2),
-                                  (255, 255, 0), 1)
-
-        corners, mask = self.find_screen(sf, relaxed=relaxed)
-
-        if corners is not None and (ox or oy):
-            corners = corners + np.array([ox, oy], dtype=np.float64)
-
-        # Fallback: full frame if ROI failed
-        if corners is None and roi is not None:
-            corners, mask = self.find_screen(frame, relaxed=relaxed)
-
-        # Second fallback: try relaxed on full frame
-        if corners is None and not relaxed:
-            corners, mask = self.find_screen(frame, relaxed=True)
+        if self._mode == self.MODE_SEARCH:
+            # Downscale full-frame search for speed
+            sf = frame
+            scale = 1.0
+            h_f, w_f = frame.shape[:2]
+            if w_f > 640:
+                scale = 640.0 / w_f
+                sf = cv2.resize(sf, None, fx=scale, fy=scale,
+                                interpolation=cv2.INTER_AREA)
+            corners, mask = self.find_screen(sf, relaxed=False)
+            if corners is None:
+                corners, mask = self.find_screen(sf, relaxed=True)
+            if corners is not None and scale < 1.0:
+                corners = corners / scale
+        else:
+            # LOCKED / COASTING — velocity-predicted ROI
+            roi = self._compute_roi(frame.shape)
+            sf = frame
+            ox, oy = 0, 0
+            if roi is not None:
+                x1, y1, x2, y2 = roi
+                if x2 > x1 + 10 and y2 > y1 + 10:
+                    sf = frame[y1:y2, x1:x2]
+                    ox, oy = x1, y1
+                    if debug:
+                        cv2.rectangle(frame, (x1, y1), (x2, y2),
+                                      (255, 255, 0), 1)
+            corners, mask = self.find_screen(sf, relaxed=True)
+            if corners is not None and (ox or oy):
+                corners = corners + np.array([ox, oy], dtype=np.float64)
+            # Fallback: full frame if ROI failed
+            if corners is None and roi is not None:
+                corners, mask = self.find_screen(frame, relaxed=True)
 
         pose = None
         coasting = False
+        t_now = time.time()
 
         if corners is not None:
             pose = self.estimate_pose(corners, frame.shape)
             if pose is not None:
                 self._last_pose = pose.copy()
                 self._last_pose['image_points'] = corners.copy()
-                self._mode = self.MODE_LOCKED
-                self.draw_results(frame, corners, pose)
+
+                # Lock confirmation: require consecutive detections
+                if self._mode == self.MODE_SEARCH:
+                    self._confirm_count += 1
+                    if self._confirm_count >= self._confirm_required:
+                        self._mode = self.MODE_LOCKED
+                else:
+                    self._mode = self.MODE_LOCKED
+
+                # Smooth corners for stable bounding box display
+                if self._mode == self.MODE_LOCKED:
+                    sm_c = self._filt_corners(
+                        corners.flatten(), t_now).reshape(4, 2)
+                else:
+                    sm_c = corners
+                self.draw_results(frame, sm_c, pose)
             else:
                 pts = corners.astype(int)
                 for i in range(4):
@@ -1011,6 +1069,7 @@ class ScreenDetector:
             self._update_tracking(corners)
 
         else:
+            self._confirm_count = 0
             self._update_tracking(None)
 
             if (self._frames_lost <= self._max_coast_frames
@@ -1068,6 +1127,8 @@ class ScreenDetector:
         self._filt_ay.reset()
         self._rot_buffer.clear()
         self._prev_area = None
+        self._filt_corners.reset()
+        self._confirm_count = 0
 
     # ================================================================ #
     #                   Utility                                         #
